@@ -1,213 +1,203 @@
 """
-Pocket Option Trader — Evalon AutoTrader
-Uses pocketoptionapi library.
-Candle-based logic: bullish close → CALL, bearish close → PUT
-Flat market filter included.
+Pocket Option Trader — Direct WebSocket Implementation
+No external library needed.
 """
-
-import asyncio
-import threading
-import time
-import logging
+import json, time, threading, logging, requests
+import websocket
 
 logger = logging.getLogger(__name__)
 
+PO_WS = "wss://api-l.po.market/trade"
 
 class PocketOptionTrader:
     def __init__(self, email, password, account_type="demo"):
         self.email = email
         self.password = password
-        self.account_type = account_type  # demo | real
-        self.client = None
+        self.account_type = account_type
+        self.ws = None
         self.connected = False
-        self.loop = None
+        self.authorized = False
         self._thread = None
+        self.balance_demo = 0.0
+        self.balance_real = 0.0
+        self.session_token = None
+        self._pending_trades = {}
 
     def connect(self):
-        """Connect to Pocket Option. Returns (success, message)"""
         try:
-            from pocketoptionapi.stable_api import PocketOption
-            self.client = PocketOption(self.email, self.password)
-            self.loop = asyncio.new_event_loop()
-            self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
-            self._thread.start()
-            future = asyncio.run_coroutine_threadsafe(self._async_connect(), self.loop)
-            return future.result(timeout=30)
-        except ImportError:
-            return False, "pocketoptionapi not installed"
-        except Exception as e:
-            logger.error(f"PocketOption connect: {e}")
-            return False, str(e)
+            # Login via HTTP
+            session = requests.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+            resp = session.post("https://po.market/api/v1/users/login", json={
+                "email": self.email,
+                "password": self.password
+            }, timeout=20)
+            
+            data = resp.json() if resp.content else {}
+            
+            # Extract token
+            token = (data.get("token") or 
+                     data.get("data", {}).get("token") or
+                     data.get("access_token") or
+                     session.cookies.get("user_auth"))
+            
+            if not token:
+                if "captcha" in str(data).lower():
+                    return False, "failed", "❌ CAPTCHA required — try again later"
+                return False, "failed", f"Login failed: {resp.status_code}"
 
-    async def _async_connect(self):
-        try:
-            check, reason = await self.client.connect()
-            if check:
-                self.connected = True
-                if self.account_type == "real":
-                    self.client.change_account("REAL")
-                else:
-                    self.client.change_account("PRACTICE")
-                return True, "Connected"
-            return False, str(reason)
+            self.session_token = token
+            self._connect_ws()
+            return True, "connected", None
+
         except Exception as e:
-            return False, str(e)
+            logger.error(f"PO connect: {e}")
+            return False, "failed", str(e)
+
+    def _connect_ws(self):
+        headers = {
+            "Authorization": f"Bearer {self.session_token}",
+            "User-Agent": "Mozilla/5.0"
+        }
+        self.ws = websocket.WebSocketApp(
+            PO_WS,
+            header=headers,
+            on_message=self._on_message,
+            on_open=self._on_open,
+            on_close=self._on_close,
+            on_error=self._on_error,
+        )
+        self._thread = threading.Thread(target=self.ws.run_forever,
+                                         kwargs={"ping_interval": 25},
+                                         daemon=True)
+        self._thread.start()
+        for _ in range(20):
+            if self.connected: break
+            time.sleep(0.5)
+
+    def _on_open(self, ws):
+        self.connected = True
+        self.authorized = True
+        ws.send(json.dumps({"action": "auth", "message": {"token": self.session_token}}))
+
+    def _on_close(self, ws, *a):
+        self.connected = False
+
+    def _on_error(self, ws, err):
+        logger.error(f"PO WS: {err}")
+
+    def _on_message(self, ws, msg):
+        try:
+            data = json.loads(msg)
+            action = data.get("action", "")
+            message = data.get("message", {})
+            
+            if action == "balance":
+                if isinstance(message, list):
+                    for b in message:
+                        if b.get("is_demo"):
+                            self.balance_demo = float(b.get("amount", 0))
+                        else:
+                            self.balance_real = float(b.get("amount", 0))
+            
+            if action in ("win", "lose", "close-option"):
+                tid = str(message.get("id", ""))
+                if tid in self._pending_trades:
+                    self._pending_trades[tid]["result"] = message
+                    self._pending_trades[tid]["event"].set()
+        except Exception as e:
+            logger.error(f"PO msg: {e}")
 
     def disconnect(self):
         try:
-            if self.client and self.loop:
-                asyncio.run_coroutine_threadsafe(self.client.close(), self.loop)
-        except Exception:
-            pass
+            if self.ws: self.ws.close()
+        except: pass
         self.connected = False
 
     def get_balance(self):
-        try:
-            future = asyncio.run_coroutine_threadsafe(self._async_balance(), self.loop)
-            return future.result(timeout=10)
-        except Exception as e:
-            logger.error(f"PO balance: {e}")
-            return {"demo": 0, "real": 0}
-
-    async def _async_balance(self):
-        try:
-            self.client.change_account("PRACTICE")
-            demo = await self.client.get_balance()
-            self.client.change_account("REAL")
-            real = await self.client.get_balance()
-            self.client.change_account("REAL" if self.account_type == "real" else "PRACTICE")
-            return {"demo": float(demo or 0), "real": float(real or 0)}
-        except Exception as e:
-            logger.error(f"PO async balance: {e}")
-            return {"demo": 0, "real": 0}
+        return {"demo": self.balance_demo, "real": self.balance_real}
 
     def switch_account(self, account_type):
         self.account_type = account_type
-        try:
-            future = asyncio.run_coroutine_threadsafe(self._async_switch(), self.loop)
-            future.result(timeout=5)
-        except Exception:
-            pass
-
-    async def _async_switch(self):
-        acct = "REAL" if self.account_type == "real" else "PRACTICE"
-        self.client.change_account(acct)
+        if self.ws and self.connected:
+            try:
+                self.ws.send(json.dumps({
+                    "action": "switch-balance",
+                    "message": {"is_demo": account_type == "demo"}
+                }))
+            except: pass
 
     def get_candles(self, asset, timeframe=60, count=5):
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_candles(asset, timeframe, count), self.loop
-            )
-            return future.result(timeout=15)
+            evt = threading.Event()
+            key = f"c_{asset}_{time.time()}"
+            self._pending_trades[key] = {"event": evt, "data": None}
+            self.ws.send(json.dumps({
+                "action": "history",
+                "message": {
+                    "symbol": asset,
+                    "period": timeframe,
+                    "time": int(time.time()),
+                    "count": count + 2
+                }
+            }))
+            evt.wait(timeout=10)
+            raw = self._pending_trades.pop(key, {}).get("data", [])
+            candles = []
+            for c in (raw or []):
+                candles.append({
+                    "open":  float(c.get("open", 0)),
+                    "close": float(c.get("close", 0)),
+                    "high":  float(c.get("high", 0)),
+                    "low":   float(c.get("low", 0)),
+                })
+            return candles[:-1]
         except Exception as e:
             logger.error(f"PO candles: {e}")
             return []
 
-    async def _async_candles(self, asset, timeframe, count):
-        try:
-            candles = await self.client.get_candles(asset, timeframe, count, time.time())
-            result = []
-            for c in candles:
-                result.append({
-                    "open":  float(c.get("open", 0)),
-                    "close": float(c.get("close", 0)),
-                    "high":  float(c.get("max", c.get("high", 0))),
-                    "low":   float(c.get("min", c.get("low", 0))),
-                })
-            return result
-        except Exception as e:
-            logger.error(f"PO async candles: {e}")
-            return []
-
     def analyze_signal(self, asset, timeframe=60):
-        """
-        Candle close logic + flat market filter.
-        Returns: 'call', 'put', or None
-        """
         candles = self.get_candles(asset, timeframe, count=3)
-        if not candles:
-            return None
+        if not candles: return None
         last = candles[-1]
-        open_p  = last["open"]
-        close_p = last["close"]
-        high    = last["high"]
-        low     = last["low"]
-        body       = abs(close_p - open_p)
-        full_range = high - low
-        if full_range < 0.00001:
-            logger.info(f"{asset}: Flat market — skip")
-            return None
-        if (body / full_range) < 0.20:
-            logger.info(f"{asset}: Flat candle — skip")
-            return None
-        if close_p > open_p:
-            return "call"
-        elif close_p < open_p:
-            return "put"
-        return None
+        o, c, h, l = last["open"], last["close"], last["high"], last["low"]
+        body = abs(c - o)
+        rng  = h - l
+        if rng < 0.00001: return None
+        if body / rng < 0.20: return None
+        return "call" if c > o else "put" if c < o else None
 
     def place_trade(self, asset, direction, amount, duration=60):
         if not self.connected:
             return False, None, "Not connected"
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_trade(asset, direction, amount, duration), self.loop
-            )
-            return future.result(timeout=20)
-        except Exception as e:
-            logger.error(f"PO trade: {e}")
-            return False, None, str(e)
-
-    async def _async_trade(self, asset, direction, amount, duration):
-        try:
-            status, trade_id = await self.client.buy(
-                price=amount,
-                active=asset,
-                action=direction,
-                expirations=duration
-            )
-            if status:
-                return True, trade_id, "Trade placed"
-            return False, None, "Rejected by broker"
+            trade_id = str(int(time.time() * 1000))
+            evt = threading.Event()
+            self._pending_trades[trade_id] = {"event": evt, "result": None}
+            self.ws.send(json.dumps({
+                "action": "open-option",
+                "message": {
+                    "asset": asset,
+                    "amount": amount,
+                    "time": duration,
+                    "action": direction,
+                    "is_demo": self.account_type == "demo",
+                    "request_id": trade_id,
+                }
+            }))
+            evt.wait(timeout=10)
+            result = self._pending_trades.get(trade_id, {}).get("result")
+            real_id = str(result.get("id", trade_id)) if result else trade_id
+            return True, real_id, "Trade placed"
         except Exception as e:
             return False, None, str(e)
 
     def check_result(self, trade_id):
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_result(trade_id), self.loop
-            )
-            return future.result(timeout=15)
-        except Exception as e:
-            logger.error(f"PO result: {e}")
+            r = self._pending_trades.pop(trade_id, {}).get("result")
+            if r:
+                profit = float(r.get("profit", r.get("win", 0)))
+                return profit > 0, abs(profit)
             return False, 0.0
-
-    async def _async_result(self, trade_id):
-        try:
-            result = await self.client.check_win(trade_id)
-            if result is None:
-                return False, 0.0
-            profit = float(result)
-            return profit > 0, abs(profit)
-        except Exception as e:
-            logger.error(f"PO async result: {e}")
+        except:
             return False, 0.0
-
-    def get_open_assets(self):
-        try:
-            future = asyncio.run_coroutine_threadsafe(self._async_assets(), self.loop)
-            return future.result(timeout=10)
-        except Exception:
-            return []
-
-    async def _async_assets(self):
-        try:
-            raw = await self.client.get_all_open_time()
-            assets = []
-            for category in raw.values():
-                for name, info in category.items():
-                    if info.get("open"):
-                        assets.append({"name": name, "payout": 0})
-            return assets
-        except Exception:
-            return []
