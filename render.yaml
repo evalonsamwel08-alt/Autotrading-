@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: evalon-autotrader
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: LICENSE_KEY
+        value: kenteboy
+      - key: ADMIN_PW
+        value: 20020225
+      - key: ADMIN_MASTER_KEY
+        value: 20020225
+      - key: DATABASE_URL
+        value: YOUR_NEON_DATABASE_URL_HERE
+      - key: SECRET_KEY
+        generateValue: true
