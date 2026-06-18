@@ -1,294 +1,223 @@
 """
-Quotex Trader — Evalon AutoTrader
-Candle-based logic: closed bullish candle → CALL, closed bearish candle → PUT
-Flat market filter included.
+Quotex Trader — Direct WebSocket Implementation
+No external broker library needed.
 """
-
-import asyncio
-import threading
-import time
-import logging
-from quotexapi.stable_api import Quotex
+import json, time, threading, logging, requests
+import websocket
 
 logger = logging.getLogger(__name__)
 
+QUOTEX_WS = "wss://ws2.trade.app/echo/websocket"
+QUOTEX_LOGIN = "https://qxbroker.com/api/v2/user/login"
 
 class QuotexTrader:
-    def __init__(self, email, password, account_type="PRACTICE"):
+    def __init__(self, email, password, account_type="demo"):
         self.email = email
         self.password = password
-        # PRACTICE = demo, REAL = real
-        self.account_type = "PRACTICE" if account_type == "demo" else "REAL"
-        self.client = None
+        self.account_type = account_type
+        self.ws = None
         self.connected = False
-        self.loop = None
-        self.thread = None
-
-    # ── Connect ──────────────────────────────────────────────────────────────
-    def connect(self):
-        """Connect to Quotex. Returns (success: bool, message: str)"""
-        try:
-            self.client = Quotex(
-                email=self.email,
-                password=self.password,
-                lang="en"
-            )
-            self.loop = asyncio.new_event_loop()
-            self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
-            self.thread.start()
-
-            future = asyncio.run_coroutine_threadsafe(self._async_connect(), self.loop)
-            result = future.result(timeout=30)
-            return result
-        except Exception as e:
-            logger.error(f"Quotex connect error: {e}")
-            return False, str(e)
-
-    async def _async_connect(self):
-        try:
-            check, reason = await self.client.connect()
-            if check:
-                self.client.change_account(self.account_type)
-                self.connected = True
-                return True, "connected", None
-            # Check if OTP is required
-            reason_str = str(reason).lower()
-            if "code" in reason_str or "otp" in reason_str or "verify" in reason_str or "email" in reason_str:
-                return False, "otp_required", None
-            return False, "failed", str(reason)
-        except Exception as e:
-            return False, "failed", str(e)
+        self.authorized = False
+        self._lock = threading.Lock()
+        self._responses = {}
+        self._req_id = 0
+        self._thread = None
+        self.balance_demo = 0.0
+        self.balance_real = 0.0
+        self.ssid = None
+        self._pending_trades = {}
 
     def connect(self):
-        """Connect to Quotex. Returns (success, status, message)
-        status: 'connected' | 'otp_required' | 'failed'
-        """
         try:
-            self.client = Quotex(
-                email=self.email,
-                password=self.password,
-                lang="en"
-            )
-            self.loop = asyncio.new_event_loop()
-            self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
-            self.thread.start()
-            future = asyncio.run_coroutine_threadsafe(self._async_connect(), self.loop)
-            success, status, msg = future.result(timeout=30)
-            return success, status, msg
+            # Step 1: Login via HTTP
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/json"
+            })
+            resp = session.post(QUOTEX_LOGIN, json={
+                "email": self.email,
+                "password": self.password
+            }, timeout=20)
+            
+            data = resp.json()
+            if "token" in data:
+                self.ssid = data["token"]
+            elif "data" in data and "token" in data["data"]:
+                self.ssid = data["data"]["token"]
+            elif resp.status_code == 200 and "session" in resp.cookies:
+                self.ssid = resp.cookies.get("session")
+            
+            if not self.ssid:
+                # Check if OTP/2FA required
+                if "code" in str(data).lower() or "verify" in str(data).lower():
+                    return False, "otp_required", None
+                return False, "failed", f"Login failed: {data}"
+            
+            # Step 2: Connect WebSocket
+            self._connect_ws()
+            return True, "connected", None
+
+        except requests.exceptions.ConnectionError:
+            return False, "failed", "No internet connection"
         except Exception as e:
-            logger.error(f"Quotex connect error: {e}")
+            logger.error(f"Quotex connect: {e}")
             return False, "failed", str(e)
+
+    def _connect_ws(self):
+        self.ws = websocket.WebSocketApp(
+            QUOTEX_WS,
+            header={"Cookie": f"session={self.ssid}"},
+            on_message=self._on_message,
+            on_open=self._on_open,
+            on_close=self._on_close,
+            on_error=self._on_error,
+        )
+        self._thread = threading.Thread(target=self.ws.run_forever,
+                                         kwargs={"ping_interval": 25},
+                                         daemon=True)
+        self._thread.start()
+        for _ in range(20):
+            if self.connected: break
+            time.sleep(0.5)
+
+    def _on_open(self, ws):
+        self.connected = True
+        self.authorized = True
+        ws.send(json.dumps({"ssid": self.ssid, "action": "ssid"}))
+
+    def _on_close(self, ws, *a):
+        self.connected = False
+
+    def _on_error(self, ws, err):
+        logger.error(f"Quotex WS: {err}")
+
+    def _on_message(self, ws, msg):
+        try:
+            data = json.loads(msg)
+            # Balance updates
+            if data.get("action") == "balance":
+                bal = data.get("data", {})
+                if isinstance(bal, dict):
+                    t = bal.get("type", 1)
+                    amount = float(bal.get("amount", 0))
+                    if t == 1:
+                        self.balance_real = amount
+                    else:
+                        self.balance_demo = amount
+            # Trade results
+            if data.get("action") == "buy-complete":
+                d = data.get("data", {})
+                tid = str(d.get("id", ""))
+                if tid in self._pending_trades:
+                    self._pending_trades[tid]["result"] = d
+                    self._pending_trades[tid]["event"].set()
+        except Exception as e:
+            logger.error(f"Quotex msg: {e}")
 
     def disconnect(self):
         try:
-            if self.client:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.client.close(), self.loop
-                )
-                future.result(timeout=5)
-        except Exception:
-            pass
+            if self.ws: self.ws.close()
+        except: pass
         self.connected = False
 
-    # ── Account Info ─────────────────────────────────────────────────────────
     def get_balance(self):
-        """Returns {'demo': float, 'real': float}"""
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_balance(), self.loop
-            )
-            return future.result(timeout=10)
-        except Exception as e:
-            logger.error(f"Balance error: {e}")
-            return {"demo": 0, "real": 0}
-
-    async def _async_balance(self):
-        try:
-            self.client.change_account("PRACTICE")
-            demo_bal = await self.client.get_balance()
-            self.client.change_account("REAL")
-            real_bal = await self.client.get_balance()
-            # restore original
-            self.client.change_account(self.account_type)
-            return {"demo": float(demo_bal or 0), "real": float(real_bal or 0)}
-        except Exception as e:
-            logger.error(f"Async balance error: {e}")
-            return {"demo": 0, "real": 0}
+        # Request balance
+        if self.ws and self.connected:
+            try:
+                self.ws.send(json.dumps({"action": "account-information", "data": {}}))
+                time.sleep(1)
+            except: pass
+        return {"demo": self.balance_demo, "real": self.balance_real}
 
     def switch_account(self, account_type):
-        """Switch between demo and real"""
-        self.account_type = "PRACTICE" if account_type == "demo" else "REAL"
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_switch(), self.loop
-            )
-            future.result(timeout=5)
-        except Exception as e:
-            logger.error(f"Switch account error: {e}")
+        self.account_type = account_type
+        acc_id = 2 if account_type == "demo" else 1
+        if self.ws and self.connected:
+            try:
+                self.ws.send(json.dumps({"action": "switch-account", "data": {"acc_id": acc_id}}))
+            except: pass
 
-    async def _async_switch(self):
-        self.client.change_account(self.account_type)
-
-    # ── Candles & Signal ─────────────────────────────────────────────────────
     def get_candles(self, asset, timeframe=60, count=5):
-        """
-        Fetch last `count` closed candles.
-        timeframe in seconds (60 = 1 minute).
-        Returns list of {'open', 'close', 'high', 'low', 'volume'}
-        """
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_candles(asset, timeframe, count), self.loop
-            )
-            return future.result(timeout=15)
-        except Exception as e:
-            logger.error(f"Candles error: {e}")
-            return []
-
-    async def _async_candles(self, asset, timeframe, count):
-        try:
-            candles = await self.client.get_candles(asset, timeframe, count, time.time())
-            result = []
-            for c in candles:
-                result.append({
+            evt = threading.Event()
+            req_id = f"candles_{time.time()}"
+            self._responses[req_id] = {"event": evt, "data": None}
+            
+            payload = json.dumps({
+                "action": "history",
+                "data": {
+                    "asset": asset,
+                    "period": timeframe,
+                    "time": int(time.time()),
+                    "offset": count * timeframe
+                }
+            })
+            self.ws.send(payload)
+            evt.wait(timeout=10)
+            raw = self._responses.pop(req_id, {}).get("data", [])
+            candles = []
+            for c in (raw or []):
+                candles.append({
                     "open":  float(c.get("open", 0)),
                     "close": float(c.get("close", 0)),
-                    "high":  float(c.get("max", 0)),
-                    "low":   float(c.get("min", 0)),
-                    "volume": float(c.get("volume", 0)),
+                    "high":  float(c.get("high", 0)),
+                    "low":   float(c.get("low", 0)),
                 })
-            return result
+            return candles
         except Exception as e:
-            logger.error(f"Async candles error: {e}")
+            logger.error(f"Quotex candles: {e}")
             return []
 
     def analyze_signal(self, asset, timeframe=60):
-        """
-        Core logic:
-        - Get last 3 closed candles
-        - If last candle is bullish (close > open) → CALL
-        - If last candle is bearish (close < open) → PUT
-        - Flat market filter: if candle body < 20% of (high-low range) → SKIP
-        Returns: 'call', 'put', or None (skip)
-        """
         candles = self.get_candles(asset, timeframe, count=3)
-        if not candles or len(candles) < 1:
-            return None
-
+        if not candles: return None
         last = candles[-1]
-        open_price  = last["open"]
-        close_price = last["close"]
-        high        = last["high"]
-        low         = last["low"]
+        o, c, h, l = last["open"], last["close"], last["high"], last["low"]
+        body = abs(c - o)
+        rng  = h - l
+        if rng < 0.00001: return None
+        if body / rng < 0.20: return None
+        return "call" if c > o else "put" if c < o else None
 
-        body = abs(close_price - open_price)
-        full_range = high - low
-
-        # ── Flat market filter ────────────────────────────────────────────────
-        # If the candle body is less than 20% of the full range, market is flat
-        # Also skip if full_range is essentially zero
-        if full_range < 0.00001:
-            logger.info(f"{asset}: Flat market (zero range) — skipping")
-            return None
-
-        body_ratio = body / full_range
-        if body_ratio < 0.20:
-            logger.info(f"{asset}: Flat candle (body ratio {body_ratio:.2%}) — skipping")
-            return None
-
-        # ── Direction ─────────────────────────────────────────────────────────
-        if close_price > open_price:
-            return "call"
-        elif close_price < open_price:
-            return "put"
-        else:
-            return None  # doji — skip
-
-    # ── Place Trade ──────────────────────────────────────────────────────────
     def place_trade(self, asset, direction, amount, duration=60):
-        """
-        Place a binary options trade.
-        direction: 'call' or 'put'
-        duration: seconds (60 = 1 minute)
-        Returns (success: bool, trade_id, message: str)
-        """
         if not self.connected:
             return False, None, "Not connected"
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_trade(asset, direction, amount, duration), self.loop
-            )
-            return future.result(timeout=20)
+            acc = 2 if self.account_type == "demo" else 1
+            trade_id = str(int(time.time() * 1000))
+            evt = threading.Event()
+            self._pending_trades[trade_id] = {"event": evt, "result": None}
+            
+            self.ws.send(json.dumps({
+                "action": "buy",
+                "data": {
+                    "asset": asset,
+                    "amount": amount,
+                    "time": duration,
+                    "action": direction,
+                    "isDemo": acc == 2,
+                    "requestId": trade_id,
+                }
+            }))
+            evt.wait(timeout=10)
+            result = self._pending_trades.pop(trade_id, {}).get("result")
+            if result:
+                real_id = str(result.get("id", trade_id))
+                return True, real_id, "Trade placed"
+            return True, trade_id, "Trade placed (pending)"
         except Exception as e:
-            logger.error(f"Trade error: {e}")
             return False, None, str(e)
 
-    async def _async_trade(self, asset, direction, amount, duration):
-        try:
-            # quotexapi uses 'call' / 'put' direction strings
-            status, trade_id = await self.client.buy(
-                amount=amount,
-                asset=asset,
-                direction=direction,
-                duration=duration
-            )
-            if status:
-                return True, trade_id, "Trade placed"
-            return False, None, "Trade rejected by broker"
-        except Exception as e:
-            logger.error(f"Async trade error: {e}")
-            return False, None, str(e)
-
-    # ── Check Result ─────────────────────────────────────────────────────────
     def check_result(self, trade_id):
-        """
-        Check win/loss for a completed trade.
-        Returns (won: bool, profit: float)
-        """
+        # After duration, check balance change
+        # Quotex sends win/loss via WebSocket automatically
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_result(trade_id), self.loop
-            )
-            return future.result(timeout=15)
-        except Exception as e:
-            logger.error(f"Result check error: {e}")
+            if trade_id in self._pending_trades:
+                result = self._pending_trades[trade_id].get("result")
+                if result:
+                    profit = float(result.get("profit", 0))
+                    return profit > 0, abs(profit)
             return False, 0.0
-
-    async def _async_result(self, trade_id):
-        try:
-            result = await self.client.check_win(trade_id)
-            if result is None:
-                return False, 0.0
-            profit = float(result)
-            won = profit > 0
-            return won, abs(profit)
-        except Exception as e:
-            logger.error(f"Async result error: {e}")
+        except:
             return False, 0.0
-
-    # ── Asset List ───────────────────────────────────────────────────────────
-    def get_open_assets(self):
-        """Return list of currently open/tradeable assets with payout %"""
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._async_assets(), self.loop
-            )
-            return future.result(timeout=10)
-        except Exception as e:
-            logger.error(f"Assets error: {e}")
-            return []
-
-    async def _async_assets(self):
-        try:
-            raw = await self.client.get_available_asset(
-                "binary",
-                is_open=True
-            )
-            assets = []
-            for name, data in (raw or {}).items():
-                payout = data.get("profit", {}).get("1", 0) if isinstance(data, dict) else 0
-                assets.append({"name": name, "payout": int(payout)})
-            return sorted(assets, key=lambda x: x["payout"], reverse=True)
-        except Exception as e:
-            logger.error(f"Async assets error: {e}")
-            return []
