@@ -19,7 +19,7 @@ from database import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__, static_folder="static")
+app = Flask(__name__, static_folder=".", static_url_path="")
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "evalon2024secret")
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -40,7 +40,7 @@ ADMIN_PW    = os.environ.get("ADMIN_PW", "evalon@2024#admin")
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return send_from_directory("static", "index.html")
+    return send_from_directory(".", "index.html")
 
 @app.route("/health")
 def health():
