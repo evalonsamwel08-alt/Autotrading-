@@ -7,7 +7,8 @@ import websocket
 
 logger = logging.getLogger(__name__)
 
-PO_WS = "wss://api-l.po.market/trade"
+PO_WS = "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+PO_LOGIN = "https://pocketoption.com/en/login/"
 
 class PocketOptionTrader:
     def __init__(self, email, password, account_type="demo"):
@@ -28,7 +29,7 @@ class PocketOptionTrader:
             # Login via HTTP
             session = requests.Session()
             session.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
-            resp = session.post("https://po.market/api/v1/users/login", json={
+            resp = session.post(PO_LOGIN, json={
                 "email": self.email,
                 "password": self.password
             }, timeout=20)
