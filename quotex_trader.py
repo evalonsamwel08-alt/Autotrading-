@@ -32,27 +32,44 @@ class QuotexTrader:
             # Step 1: Login via HTTP
             session = requests.Session()
             session.headers.update({
-                "User-Agent": "Mozilla/5.0",
-                "Content-Type": "application/json"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://qxbroker.com",
+                "Referer": "https://qxbroker.com/en/sign-in",
             })
             resp = session.post(QUOTEX_LOGIN, json={
                 "email": self.email,
                 "password": self.password
             }, timeout=20)
             
-            data = resp.json()
+            # Parse response safely
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
             if "token" in data:
                 self.ssid = data["token"]
-            elif "data" in data and "token" in data["data"]:
+            elif "data" in data and isinstance(data["data"], dict) and "token" in data["data"]:
                 self.ssid = data["data"]["token"]
-            elif resp.status_code == 200 and "session" in resp.cookies:
-                self.ssid = resp.cookies.get("session")
-            
+            else:
+                # Try cookies
+                for cookie_name in ["session", "token", "auth", "ssid"]:
+                    val = resp.cookies.get(cookie_name)
+                    if val:
+                        self.ssid = val
+                        break
+
             if not self.ssid:
-                # Check if OTP/2FA required
-                if "code" in str(data).lower() or "verify" in str(data).lower():
+                text = resp.text.lower()
+                if "code" in text or "verify" in text or "otp" in text:
                     return False, "otp_required", None
-                return False, "failed", f"Login failed: {data}"
+                if "captcha" in text:
+                    return False, "failed", "❌ CAPTCHA required — try again later"
+                if resp.status_code == 401:
+                    return False, "failed", "❌ Wrong email or password"
+                return False, "failed", f"❌ Login failed (status {resp.status_code})"
             
             # Step 2: Connect WebSocket
             self._connect_ws()
