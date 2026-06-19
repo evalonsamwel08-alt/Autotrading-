@@ -7,8 +7,8 @@ import os
 import time
 import threading
 import logging
-from flask import Flask, send_from_directory
-from flask_socketio import SocketIO, emit
+from flask import Flask, send_from_directory, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 from database import (
     init_db, verify_license, create_license, delete_license,
@@ -50,11 +50,11 @@ def health():
 
 @socketio.on("connect")
 def on_connect():
-    logger.info(f"Client connected: {socketio.request.sid}")
+    logger.info(f"Client connected: {request.sid}")
 
 @socketio.on("disconnect")
 def on_disconnect():
-    sid = socketio.request.sid
+    sid = request.sid
     _stop_bot(sid)
     if sid in sessions:
         try:
@@ -67,7 +67,7 @@ def on_disconnect():
 # ── LOGIN ─────────────────────────────────────────────────────────────────────
 @socketio.on("login")
 def on_login(data):
-    sid = socketio.request.sid
+    sid = request.sid
     email    = data.get("email", "").strip()
     password = data.get("password", "").strip()
     broker   = data.get("broker", "quotex")
@@ -176,7 +176,7 @@ def on_login(data):
 # ── SWITCH ACCOUNT (demo ↔ real) ──────────────────────────────────────────────
 @socketio.on("switch_account")
 def on_switch_account(data):
-    sid = socketio.request.sid
+    sid = request.sid
     sess = sessions.get(sid)
     if not sess:
         return
@@ -189,7 +189,7 @@ def on_switch_account(data):
 # ── SETTINGS ──────────────────────────────────────────────────────────────────
 @socketio.on("update_settings")
 def on_settings(data):
-    sid = socketio.request.sid
+    sid = request.sid
     sess = sessions.get(sid)
     if not sess:
         return
@@ -205,7 +205,7 @@ def on_settings(data):
 # ── START BOT ─────────────────────────────────────────────────────────────────
 @socketio.on("start_bot")
 def on_start(data):
-    sid = socketio.request.sid
+    sid = request.sid
     sess = sessions.get(sid)
     if not sess:
         emit("bot_error", {"message": "Not logged in"})
@@ -232,7 +232,7 @@ def on_start(data):
 # ── STOP BOT ──────────────────────────────────────────────────────────────────
 @socketio.on("stop_bot")
 def on_stop():
-    sid = socketio.request.sid
+    sid = request.sid
     _stop_bot(sid)
     emit("bot_stopped", {})
 
@@ -244,7 +244,7 @@ def _stop_bot(sid):
 # ── LOGOUT ────────────────────────────────────────────────────────────────────
 @socketio.on("logout")
 def on_logout():
-    sid = socketio.request.sid
+    sid = request.sid
     _stop_bot(sid)
     if sid in sessions:
         try:
@@ -258,7 +258,7 @@ def on_logout():
 @socketio.on("submit_otp")
 def on_submit_otp(data):
     """User submits OTP code sent by broker (Quotex email/SMS code)."""
-    sid = socketio.request.sid
+    sid = request.sid
     otp = data.get("code", "").strip()
     sess = sessions.get(sid)
     if not sess:
@@ -289,7 +289,7 @@ def on_submit_otp(data):
         emit("otp_result", {"success": False, "message": f"❌ Wrong code: {e}"})
 @socketio.on("refresh_balance")
 def on_refresh():
-    sid = socketio.request.sid
+    sid = request.sid
     sess = sessions.get(sid)
     if not sess:
         return
@@ -312,7 +312,7 @@ def on_admin_auth(data):
 
 @socketio.on("admin_set_balance")
 def on_admin_balance(data):
-    sid = socketio.request.sid
+    sid = request.sid
     sess = sessions.get(sid)
     if not sess:
         return
